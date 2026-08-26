@@ -1,0 +1,81 @@
+@import "tailwindcss";
+
+/* DocuSense AI design tokens — "Ink & Highlighter" (Tailwind v4 @theme) */
+@theme {
+  --color-ink-950: #0E1116;
+  --color-ink-900: #141821;
+  --color-ink-800: #1C2129;
+
+  --color-paper-50: #F6F4EF;
+  --color-paper-100: #EFEBE1;
+
+  --color-slate-400: #8A93A6;
+  --color-slate-600: #5B6373;
+
+  --color-highlight-400: #F4C744;
+  --color-highlight-500: #E0B32E;
+
+  --color-verify-500: #3FBF9F;
+  --color-risk-500: #E2664B;
+
+  --font-display: var(--font-display), Georgia, serif;
+  --font-body: var(--font-body), sans-serif;
+  --font-mono: var(--font-mono), monospace;
+
+  --shadow-page: 0 20px 60px -15px rgba(0, 0, 0, 0.5);
+  --shadow-beam: 0 0 24px 4px rgba(244, 199, 68, 0.55);
+
+  --animate-beam-sweep: beam-sweep 5.2s ease-in-out infinite;
+}
+
+@keyframes beam-sweep {
+  0%   { top: 10%; opacity: 0; }
+  10%  { opacity: 0.9; }
+  90%  { opacity: 0.9; }
+  100% { top: 85%; opacity: 0; }
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+/* ------------------------------------------------------------------
+ * pdf.js text layer (PdfViewer.tsx)
+ *
+ * pdf.js's TextLayer class only creates the <span> elements and sets
+ * their position/--font-height — it does NOT ship these layout rules
+ * itself (they normally live in pdf.js's own pdf_viewer.css, which
+ * this project doesn't import). Without them the spans are unstyled
+ * and their selectable hit-boxes don't line up with the rendered
+ * glyphs on the canvas underneath.
+ * ------------------------------------------------------------------ */
+.textLayer {
+  position: absolute;
+  top: 0;
+  left: 0;
+  overflow: hidden;
+  line-height: 1;
+  text-align: initial;
+  user-select: text;
+  -webkit-user-select: text;
+  forced-color-adjust: none;
+  transform-origin: 0 0;
+  z-index: 2;
+}
+
+.textLayer span,
+.textLayer br {
+  color: transparent;
+  position: absolute;
+  white-space: pre;
+  cursor: text;
+  transform-origin: 0% 0%;
+  /* --font-height is set per-span by pdf.js in unscaled PDF units;
+     --total-scale-factor is set by PdfViewer.tsx to the current zoom
+     level. Without this rule every span renders at the wrong size. */
+  font-size: calc(var(--total-scale-factor) * var(--font-height));
+}
+
+.textLayer ::selection {
+  background: rgba(37, 99, 235, 0.35);
+}
