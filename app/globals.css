@@ -1,4 +1,5 @@
 @import "tailwindcss";
+@plugin "@tailwindcss/typography";
 
 /* DocuSense AI design tokens — "Ink & Highlighter" (Tailwind v4 @theme) */
 @theme {
@@ -23,20 +24,78 @@
   --font-mono: var(--font-mono), monospace;
 
   --shadow-page: 0 20px 60px -15px rgba(0, 0, 0, 0.5);
-  --shadow-beam: 0 0 24px 4px rgba(244, 199, 68, 0.55);
+  --shadow-beam: 0 0 16px 2px rgba(244, 199, 68, 0.32);
 
   --animate-beam-sweep: beam-sweep 5.2s ease-in-out infinite;
 }
 
 @keyframes beam-sweep {
   0%   { top: 10%; opacity: 0; }
-  10%  { opacity: 0.9; }
-  90%  { opacity: 0.9; }
+  10%  { opacity: 0.5; }
+  90%  { opacity: 0.5; }
   100% { top: 85%; opacity: 0; }
+}
+/* ------------------------------------------------------------------
+ * Theme system (light/dark)
+ *
+ * Semantic variables that components should reference instead of the
+ * raw --color-ink-950 / --color-paper-50 tokens above, so the same
+ * className works in both themes. Dark is the default (matches
+ * :root); [data-theme="light"] on <html> flips every value.
+ * Use like: className="bg-[var(--bg)] text-[var(--text)]"
+ * ------------------------------------------------------------------ */
+:root {
+  --bg: var(--color-ink-950);
+  --surface: var(--color-ink-900);
+  --surface-2: var(--color-ink-800);
+  --text: var(--color-paper-50);
+  --text-muted: var(--color-slate-400);
+  --border-subtle: rgba(255, 255, 255, 0.1);
+  --accent: var(--color-highlight-400);
+  --accent-strong: var(--color-highlight-500);
+  --glow-rgb: 244, 199, 68;
+}
+
+[data-theme="light"] {
+  --bg: var(--color-paper-50);
+  --surface: #FFFFFF;
+  --surface-2: var(--color-paper-100);
+  --text: var(--color-ink-950);
+  --text-muted: var(--color-slate-600);
+  --border-subtle: rgba(14, 17, 22, 0.1);
+  --accent: var(--color-highlight-500);
+  --accent-strong: #C99A1E;
+  --glow-rgb: 224, 179, 46;
+}
+
+body {
+  transition: background-color 0.25s ease, color 0.25s ease;
 }
 
 html {
   scroll-behavior: smooth;
+}
+
+/* ------------------------------------------------------------------
+ * Interactive baseline
+ *
+ * Unlike <a>, browsers don't give <button> a pointer cursor by
+ * default (and Tailwind's preflight doesn't add it back either) —
+ * so every button in the app was showing the plain arrow cursor on
+ * hover, which is why hover states didn't read as "interactive"
+ * even where the color/scale change was already working. This also
+ * gives every button a smooth default transition so hover/press
+ * feedback never feels like an instant snap, even on buttons that
+ * don't declare their own transition/duration utility.
+ * ------------------------------------------------------------------ */
+button:not(:disabled) {
+  cursor: pointer;
+  transition-property: background-color, border-color, color, opacity, transform, box-shadow;
+  transition-duration: 200ms;
+  transition-timing-function: ease-out;
+}
+button:disabled {
+  cursor: not-allowed;
 }
 
 /* ------------------------------------------------------------------
@@ -78,4 +137,24 @@ html {
 
 .textLayer ::selection {
   background: rgba(37, 99, 235, 0.35);
+}
+
+
+.docusense-glow-orb {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 260px;
+  height: 260px;
+  margin-left: -130px;
+  margin-top: -130px;
+  border-radius: 9999px;
+  background: radial-gradient(
+    circle,
+    rgba(var(--glow-rgb), 0.16) 0%,
+    rgba(var(--glow-rgb), 0.06) 40%,
+    rgba(var(--glow-rgb), 0) 70%
+  );
+  filter: blur(4px);
+  will-change: transform;
 }

@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { Fraunces, Inter, IBM_Plex_Mono } from "next/font/google";
 import { AuthProvider } from "@/lib/AuthContext";
+import { ThemeProvider } from "@/lib/ThemeContext";
 import "./globals.css";
 
 const display = Fraunces({
@@ -32,9 +33,13 @@ export default function RootLayout({
   return (
     <html lang="en">
       <body
-        className={`${display.variable} ${body.variable} ${mono.variable} bg-ink-950 antialiased`}
+        className={`${display.variable} ${body.variable} ${mono.variable} bg-[var(--bg)] text-[var(--text)] antialiased relative`}
       >
-        <AuthProvider>{children}</AuthProvider>
+        <ThemeProvider>
+          <AuthProvider>
+            <div className="relative z-10">{children}</div>
+          </AuthProvider>
+        </ThemeProvider>
       </body>
     </html>
   );

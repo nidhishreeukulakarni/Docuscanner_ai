@@ -2,16 +2,17 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
+import ReactMarkdown from "react-markdown";
 import Navbar from "@/components/Navbar";
 import PdfViewer, { type PageHighlight, type SelectionAction } from "@/components/document-viewer/PdfViewer";
-import ImagePreview from "@/components/document-viewer/ImagePreview";
-import UnsupportedPreview from "@/components/document-viewer/UnsupportedPreview";
 import { useAuth } from "@/lib/AuthContext";
 import {
   uploadDocument,
   sendChatMessage,
+  sendMultiDocChatMessage,
   summarizeDocument,
   getChatHistory,
+  getMultiDocChatHistory,
   saveAnnotation,
   listAnnotations,
   deleteAnnotation,
@@ -22,35 +23,11 @@ import {
   type DocumentSummary,
   type AnnotationRecord,
 } from "@/lib/api";
-
-/**
- * Workspace (v4 — real viewer + real upload + real chat)
- * ------------------------------------------------------------
- * Split-pane layout per SRS FR-02.3: left panel hosts the
- * Document Viewer, right panel hosts Chat / Summary / Highlights.
- *
- * Upload does two things at once on file select:
- *   1. Reads the file into memory client-side and hands it straight
- *      to <PdfViewer fileBytes={...}> so rendering doesn't wait on
- *      the network — instant feedback.
- *   2. POSTs the same file to POST /documents/upload, which runs
- *      OCR + chunking + embedding synchronously and returns
- *      { document_id, file_key, page_count, chunk_count, status }.
- *      document_id is what Step 6 chat is scoped to.
- *
- * Chat (Step 6) streams from POST /chat/{document_id} via SSE:
- *   - "citations" event arrives first with the chunk(s) — page_num +
- *     bbox — the answer will be grounded in
- *   - "token" events stream the answer text incrementally
- *   - "done" closes out the turn
- * See lib/api.ts (sendChatMessage) for the parsing.
- *
- * file_key from the upload response is NOT a usable URL yet —
- * store_original() in the backend is still a stub, so there's
- * nothing to fetch back. PdfViewer keeps using the in-memory bytes
- * until real storage exists.
- * ------------------------------------------------------------
- */
+import {
+  downloadMarkdown,
+  copySummaryToClipboard,
+  exportSummaryAsPdf,
+} from "@/lib/exportSummary";
 
 type RightTab = "chat" | "summary" | "highlights";
 type IngestStatus = "idle" | "uploading" | "ready" | "error";
@@ -62,20 +39,24 @@ interface ChatMessage {
   streaming?: boolean;
 }
 
+interface OpenDocument {
+  id: string;
+  title: string;
+  fileBytes: ArrayBuffer;
+  pageCount: number;
+  chunkCount: number;
+}
+
+type ChatScope = "single" | "all";
+
 const TABS: { id: RightTab; label: string }[] = [
   { id: "chat", label: "Chat" },
   { id: "summary", label: "Summary" },
   { id: "highlights", label: "Highlights" },
 ];
 
-/** SelectionAction is defined once in PdfViewer.tsx (the file that owns
- * the floating toolbar and actually calls onAskAboutSelection) and
- * imported here, so the two files can never drift out of sync again.
- * Kept as a local alias so nothing else below has to be renamed. */
 type SelectionPreset = SelectionAction;
 
-/** Fixed prompts for the 3 auto-send pills. "ask" isn't listed here —
- * it leaves the chat input free-text for the user to fill in. */
 const PRESET_PROMPTS: Record<Exclude<SelectionPreset, "ask">, string> = {
   explain: "Explain this passage simply, in plain language a beginner could follow.",
   summarize: "Summarize this selected passage concisely.",
@@ -89,10 +70,6 @@ const PRESET_LABELS: Record<SelectionPreset, string> = {
   risks: "Identify Risks",
 };
 
-/** One saved passage the user acted on via a selection pill — shown
- * in the Highlights tab. `annoId` is set once the backend confirms
- * the save (Step 9); until then, or if the save fails, the highlight
- * still shows locally with annoId left null. */
 interface SavedHighlight {
   id: string;
   annoId: string | null;
@@ -104,9 +81,6 @@ interface SavedHighlight {
 
 const PRESET_KEYS: SelectionPreset[] = ["ask", "explain", "summarize", "risks"];
 
-/** Recovers a saved highlight from a backend AnnotationRecord —
- * ai_notes carries the preset key as a plain string. Falls back to
- * "explain" for any older/unrecognized value so rendering never breaks. */
 function highlightFromAnnotation(a: AnnotationRecord): SavedHighlight {
   const preset = PRESET_KEYS.includes(a.ai_notes as SelectionPreset)
     ? (a.ai_notes as SelectionPreset)
@@ -125,9 +99,6 @@ export default function WorkspacePage() {
   const router = useRouter();
   const { user, loading } = useAuth();
 
-  // Bounce to /login if there's no session — checked after the initial
-  // sessionStorage restore in AuthProvider finishes (avoids redirecting
-  // a refreshed page before the token's had a chance to load).
   useEffect(() => {
     if (!loading && !user) {
       router.replace("/login");
@@ -135,46 +106,47 @@ export default function WorkspacePage() {
   }, [loading, user, router]);
 
   const [activeTab, setActiveTab] = useState<RightTab>("chat");
-  const [fileBytes, setFileBytes] = useState<ArrayBuffer | null>(null);
-  const [fileName, setFileName] = useState<string | null>(null);
-  const [fileMimeType, setFileMimeType] = useState<string | null>(null);
+
+  const [documents, setDocuments] = useState<OpenDocument[]>([]);
+  const [activeDocId, setActiveDocId] = useState<string | null>(null);
+  const activeDoc = documents.find((d) => d.id === activeDocId) ?? null;
+  const fileBytes = activeDoc?.fileBytes ?? null;
+  const fileName = activeDoc?.title ?? null;
+  const ingestResult: UploadDocumentResponse | null = activeDoc
+    ? {
+        document_id: activeDoc.id,
+        file_key: "",
+        page_count: activeDoc.pageCount,
+        chunk_count: activeDoc.chunkCount,
+        status: "ready",
+      }
+    : null;
+
   const [ingestStatus, setIngestStatus] = useState<IngestStatus>("idle");
-  const [ingestResult, setIngestResult] =
-    useState<UploadDocumentResponse | null>(null);
   const [ingestError, setIngestError] = useState<string | null>(null);
+  const [isDraggingFile, setIsDraggingFile] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  // --- chat state ---
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [chatInput, setChatInput] = useState("");
   const [chatStreaming, setChatStreaming] = useState(false);
   const [chatError, setChatError] = useState<string | null>(null);
   const chatAbortRef = useRef<AbortController | null>(null);
+  const [chatScope, setChatScope] = useState<ChatScope>("single");
 
-  // Setting this jumps <PdfViewer> to a page when a citation chip is
-  // clicked. PdfViewer's jump effect only fires when the value
-  // changes, so clicking the same page chip twice in a row won't
-  // re-scroll — acceptable for now.
   const [jumpToPage, setJumpToPage] = useState<number | undefined>(
     undefined
   );
 
-  // The bbox(es) to draw over the document — set when a citation chip
-  // is clicked, alongside jumpToPage. A single chip can carry more than
-  // one chunk on the same page, so this is a list.
   const [activeHighlights, setActiveHighlights] = useState<PageHighlight[]>(
     []
   );
 
-  // Step 8: set when the user selects text in the viewer and taps "Ask
-  // about this" — the next chat message is scoped to just this passage
-  // instead of the whole document. Cleared after that message sends.
   const [scopedSelection, setScopedSelection] = useState<{
     text: string;
     page: number;
   } | null>(null);
 
-  // --- summary state (Step 7 frontend wiring) ---
   const [summaryStatus, setSummaryStatus] = useState<
     "idle" | "loading" | "ready" | "error"
   >("idle");
@@ -188,11 +160,8 @@ export default function WorkspacePage() {
   );
   const [summaryError, setSummaryError] = useState<string | null>(null);
   const summaryAbortRef = useRef<AbortController | null>(null);
-  // Which document_id the current summary belongs to, so switching
-  // documents doesn't show a stale summary under the new one.
   const summaryDocIdRef = useRef<string | null>(null);
 
-  // --- highlights state (pairs with the 4-pill toolbar) ---
   const [savedHighlights, setSavedHighlights] = useState<SavedHighlight[]>(
     []
   );
@@ -201,23 +170,20 @@ export default function WorkspacePage() {
     e: React.ChangeEvent<HTMLInputElement>
   ) => {
     const file = e.target.files?.[0];
-    e.target.value = ""; // allow re-selecting the same file later
+    e.target.value = "";
     if (!file) return;
+    await processFile(file);
+  };
 
-    // 1. Render immediately from the raw bytes, independent of the network call.
-    const bytes = await file.arrayBuffer();
-    setFileBytes(bytes);
-    setFileName(file.name);
-    setFileMimeType(file.type);
-
-    // 2. Reset chat — a new document means a new conversation.
-    chatAbortRef.current?.abort();
-    setChatMessages([]);
-    setChatError(null);
-    setChatStreaming(false);
+  const processFile = async (file: File) => {
+    if (chatScope === "single") {
+      chatAbortRef.current?.abort();
+      setChatMessages([]);
+      setChatError(null);
+      setChatStreaming(false);
+    }
     setActiveHighlights([]);
 
-    // Reset summary + saved highlights too — they belonged to the old document.
     summaryAbortRef.current?.abort();
     summaryDocIdRef.current = null;
     setSummaryStatus("idle");
@@ -227,16 +193,24 @@ export default function WorkspacePage() {
     setSummaryError(null);
     setSavedHighlights([]);
 
-    // 3. Kick off real ingestion in parallel.
+    setActiveDocId(null);
     setIngestStatus("uploading");
     setIngestError(null);
-    setIngestResult(null);
 
     try {
+      const bytes = await file.arrayBuffer();
       const result = await uploadDocument(file);
-      setIngestResult(result);
+      const opened: OpenDocument = {
+        id: result.document_id,
+        title: file.name,
+        fileBytes: bytes,
+        pageCount: result.page_count,
+        chunkCount: result.chunk_count,
+      };
+      setDocuments((prev) => [...prev, opened]);
+      setActiveDocId(opened.id);
       setIngestStatus("ready");
-      hydrateDocumentState(result.document_id);
+      hydrateDocumentState(result.document_id, { loadChatHistory: chatScope === "single" });
     } catch (err) {
       const message =
         err instanceof ApiError
@@ -247,26 +221,106 @@ export default function WorkspacePage() {
     }
   };
 
-  // Step 9: loads any previously-saved chat turns and highlights for
-  // this document_id. For a brand-new upload these will always come
-  // back empty (each upload gets a fresh document_id — reopening a
-  // past document isn't wired up yet), but this is what makes chat +
-  // highlights durable once that gap closes. Failures here are
-  // non-fatal — the workspace still works, just starts blank.
-  const hydrateDocumentState = async (documentId: string) => {
-    try {
-      const history = await getChatHistory(documentId);
-      if (history.length > 0) {
-        setChatMessages(
-          history.map((m) => ({
-            role: m.role,
-            content: m.content,
-            citations: m.citations ?? undefined,
-          }))
-        );
+  const handleDragOver = (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    if (!isDraggingFile) setIsDraggingFile(true);
+  };
+
+  const handleDragLeave = (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    if (e.currentTarget === e.target) setIsDraggingFile(false);
+  };
+
+  const handleDrop = async (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    setIsDraggingFile(false);
+    const file = e.dataTransfer.files?.[0];
+    if (file) await processFile(file);
+  };
+
+  const handleSwitchDocument = (docId: string) => {
+    if (docId === activeDocId) return;
+
+    summaryAbortRef.current?.abort();
+    setActiveHighlights([]);
+    summaryDocIdRef.current = null;
+    setSummaryStatus("idle");
+    setSummaryMessage(null);
+    setSummaryProgress(null);
+    setSummaryResult(null);
+    setSummaryError(null);
+    setSavedHighlights([]);
+    setIngestStatus("ready");
+    setIngestError(null);
+
+    if (chatScope === "single") {
+      chatAbortRef.current?.abort();
+      setChatMessages([]);
+      setChatError(null);
+      setChatStreaming(false);
+    }
+
+    setActiveDocId(docId);
+    hydrateDocumentState(docId, { loadChatHistory: chatScope === "single" });
+  };
+
+  const handleRemoveDocument = (docId: string) => {
+    const remaining = documents.filter((d) => d.id !== docId);
+    setDocuments(remaining);
+
+    if (docId !== activeDocId) return;
+
+    summaryAbortRef.current?.abort();
+    setActiveHighlights([]);
+    summaryDocIdRef.current = null;
+    setSummaryStatus("idle");
+    setSummaryMessage(null);
+    setSummaryProgress(null);
+    setSummaryResult(null);
+    setSummaryError(null);
+    setSavedHighlights([]);
+
+    if (chatScope === "single") {
+      chatAbortRef.current?.abort();
+      setChatMessages([]);
+      setChatError(null);
+      setChatStreaming(false);
+    }
+
+    if (remaining.length > 0) {
+      const next = remaining[remaining.length - 1];
+      setActiveDocId(next.id);
+      setIngestStatus("ready");
+      setIngestError(null);
+      if (chatScope === "single") {
+        hydrateDocumentState(next.id, { loadChatHistory: true });
       }
-    } catch (err) {
-      console.warn("Couldn't load chat history:", err);
+    } else {
+      setActiveDocId(null);
+      setIngestStatus("idle");
+      setIngestError(null);
+    }
+  };
+
+  const hydrateDocumentState = async (
+    documentId: string,
+    opts: { loadChatHistory?: boolean } = {}
+  ) => {
+    if (opts.loadChatHistory ?? true) {
+      try {
+        const history = await getChatHistory(documentId);
+        if (history.length > 0) {
+          setChatMessages(
+            history.map((m) => ({
+              role: m.role,
+              content: m.content,
+              citations: m.citations ?? undefined,
+            }))
+          );
+        }
+      } catch (err) {
+        console.warn("Couldn't load chat history:", err);
+      }
     }
 
     try {
@@ -279,13 +333,6 @@ export default function WorkspacePage() {
     }
   };
 
-  // Step 8/toolbar: fired by PdfViewer when the user selects text and
-  // taps one of the 4 preset pills. "ask" just populates the scoped
-  // selection and lets the user type their own question, same as
-  // before. The other 3 pills save the passage to the Highlights tab
-  // (Step 9: persisted to the backend Annotation table, with an
-  // optimistic local entry shown immediately) and send a fixed prompt
-  // through the same chat pipeline.
   const handleAskAboutSelection = (
     text: string,
     page: number,
@@ -318,8 +365,6 @@ export default function WorkspacePage() {
           );
         })
         .catch((err) => {
-          // Non-fatal — the highlight still shows locally for this
-          // session, it just won't survive a refresh.
           console.warn("Couldn't persist highlight:", err);
         });
     }
@@ -327,19 +372,42 @@ export default function WorkspacePage() {
     handleSendChat(PRESET_PROMPTS[preset], { text, page });
   };
 
-  /**
-   * Sends a chat turn. Defaults to whatever's typed in the input box
-   * and the current scopedSelection state, so the Send button and
-   * Enter key can keep calling it with no arguments. The 3 auto-send
-   * preset pills pass an explicit question + selection instead so
-   * they don't depend on (or clobber) whatever the user was typing.
-   */
+  const handleChatScopeChange = (scope: ChatScope) => {
+    if (scope === chatScope) return;
+    chatAbortRef.current?.abort();
+    setChatStreaming(false);
+    setChatError(null);
+    setScopedSelection(null);
+    setChatScope(scope);
+    setChatMessages([]);
+
+    if (scope === "all") {
+      getMultiDocChatHistory()
+        .then((history) => {
+          if (history.length > 0) {
+            setChatMessages(
+              history.map((m) => ({
+                role: m.role,
+                content: m.content,
+                citations: m.citations ?? undefined,
+              }))
+            );
+          }
+        })
+        .catch((err) => console.warn("Couldn't load multi-doc chat history:", err));
+    } else if (activeDocId) {
+      hydrateDocumentState(activeDocId, { loadChatHistory: true });
+    }
+  };
+
   const handleSendChat = (
     questionOverride?: string,
     scopedOverride?: { text: string; page: number }
   ) => {
     const question = (questionOverride ?? chatInput).trim();
-    if (!question || !ingestResult || chatStreaming) return;
+    const usingAllDocsScope = chatScope === "all" && !scopedOverride && !scopedSelection;
+    if (!question || chatStreaming) return;
+    if (!usingAllDocsScope && !ingestResult) return;
 
     const history: ChatHistoryTurn[] = chatMessages
       .filter((m) => !m.streaming)
@@ -357,62 +425,74 @@ export default function WorkspacePage() {
     const sendingScopedTo = scopedOverride ?? scopedSelection;
     setScopedSelection(null);
 
-    chatAbortRef.current = sendChatMessage(
-      ingestResult.document_id,
-      question,
-      history,
-      {
-        onCitations: (citations) => {
-          setChatMessages((prev) => {
-            const next = [...prev];
-            next[next.length - 1] = { ...next[next.length - 1], citations };
-            return next;
-          });
-        },
-        onToken: (text) => {
-          setChatMessages((prev) => {
-            const next = [...prev];
-            const last = next[next.length - 1];
-            next[next.length - 1] = {
-              ...last,
-              content: last.content + text,
-            };
-            return next;
-          });
-        },
-        onDone: () => {
-          setChatMessages((prev) => {
-            const next = [...prev];
-            next[next.length - 1] = {
-              ...next[next.length - 1],
-              streaming: false,
-            };
-            return next;
-          });
-          setChatStreaming(false);
-        },
-        onError: (err) => {
-          const message =
-            err instanceof ApiError
-              ? err.message
-              : "Lost connection to the chat backend.";
-          setChatError(message);
-          setChatStreaming(false);
-          // Drop the empty assistant bubble that was streaming.
-          setChatMessages((prev) => prev.filter((m) => !m.streaming));
-        },
+    const handlers = {
+      onCitations: (citations: Citation[]) => {
+        setChatMessages((prev) => {
+          const next = [...prev];
+          next[next.length - 1] = { ...next[next.length - 1], citations };
+          return next;
+        });
       },
-      sendingScopedTo ?? undefined
-    );
+      onToken: (text: string) => {
+        setChatMessages((prev) => {
+          const next = [...prev];
+          const last = next[next.length - 1];
+          next[next.length - 1] = {
+            ...last,
+            content: last.content + text,
+          };
+          return next;
+        });
+      },
+      onDone: () => {
+        setChatMessages((prev) => {
+          const next = [...prev];
+          next[next.length - 1] = {
+            ...next[next.length - 1],
+            streaming: false,
+          };
+          return next;
+        });
+        setChatStreaming(false);
+      },
+      onError: (err: ApiError | Error) => {
+        const message =
+          err instanceof ApiError
+            ? err.message
+            : "Lost connection to the chat backend.";
+        setChatError(message);
+        setChatStreaming(false);
+        setChatMessages((prev) => prev.filter((m) => !m.streaming));
+      },
+    };
+
+    if (usingAllDocsScope) {
+      chatAbortRef.current = sendMultiDocChatMessage(question, history, handlers);
+    } else {
+      chatAbortRef.current = sendChatMessage(
+        ingestResult!.document_id,
+        question,
+        history,
+        handlers,
+        sendingScopedTo ?? undefined
+      );
+    }
   };
 
-  // Fired when a citation chip is clicked: jump the viewer to that page
-  // and light up every chunk box on it that this answer was grounded in.
-  const handleCitationClick = (page: number, citations: Citation[]) => {
+  const handleCitationClick = (
+    page: number,
+    citations: Citation[],
+    docId?: string
+  ) => {
+    if (docId && docId !== activeDocId) {
+      handleSwitchDocument(docId);
+    }
     setJumpToPage(page);
     setActiveHighlights(
       citations
-        .filter((c) => c.page_num === page && c.bbox)
+        .filter(
+          (c) => c.page_num === page && c.bbox && (!docId || c.doc_id === docId)
+        )
         .map((c) => ({ page_num: c.page_num, bbox: c.bbox! }))
     );
   };
@@ -424,8 +504,6 @@ export default function WorkspacePage() {
     }
   };
 
-  // Step 7 frontend: kicks off POST /summary/{document_id}. Safe to
-  // call again after a failure (retry) — it just restarts the stream.
   const handleGenerateSummary = () => {
     if (!ingestResult || summaryStatus === "loading") return;
 
@@ -453,16 +531,11 @@ export default function WorkspacePage() {
     });
   };
 
-  // Jumps the viewer to a saved highlight's page (no bbox stored for
-  // free-text selections, so this just scrolls — it doesn't draw a box).
   const handleJumpToHighlight = (h: SavedHighlight) => {
     setJumpToPage(h.page);
     setActiveHighlights([]);
   };
 
-  // Step 9: removes a saved highlight. Updates local state immediately;
-  // if it was already persisted (annoId set) also deletes it on the
-  // backend so it doesn't reappear on the next reload.
   const handleDeleteHighlight = (h: SavedHighlight) => {
     setSavedHighlights((prev) => prev.filter((x) => x.id !== h.id));
     if (h.annoId && ingestResult) {
@@ -474,10 +547,10 @@ export default function WorkspacePage() {
 
   if (loading || !user) {
     return (
-      <main className="min-h-screen bg-ink-950 text-paper-50 flex flex-col">
+      <main className="min-h-screen bg-[var(--bg)] text-[var(--text)] flex flex-col">
         <Navbar />
         <div className="flex-1 flex items-center justify-center">
-          <p className="font-body text-sm text-slate-400">
+          <p className="font-body text-sm text-[var(--text-muted)]">
             {loading ? "Loading…" : "Redirecting to login…"}
           </p>
         </div>
@@ -486,23 +559,86 @@ export default function WorkspacePage() {
   }
 
   return (
-    <main className="min-h-screen md:h-screen bg-ink-950 text-paper-50 flex flex-col md:overflow-hidden">
+    <main className="min-h-screen md:h-screen bg-[var(--bg)] text-[var(--text)] flex flex-col md:overflow-hidden">
       <Navbar />
 
       <div className="flex-1 grid grid-cols-1 md:grid-cols-2 min-h-0 md:overflow-hidden">
         {/* Left panel — Document Viewer */}
-        <section className="relative border-b md:border-b-0 md:border-r border-white/10 flex flex-col min-h-[50vh] md:min-h-0">
-          <div className="px-6 py-4 border-b border-white/10 flex items-center justify-between gap-3">
-            <span className="font-mono text-xs tracking-widest text-slate-400 uppercase truncate">
+        <section
+          onDragOver={handleDragOver}
+          onDragLeave={handleDragLeave}
+          onDrop={handleDrop}
+          className={`relative border-b md:border-b-0 md:border-r border-[var(--border-subtle)] flex flex-col min-h-[50vh] md:min-h-0 transition-colors ${
+            isDraggingFile ? "bg-[var(--accent)]/5 ring-2 ring-inset ring-[var(--accent)]/40" : ""
+          }`}
+        >
+          {isDraggingFile && (
+            <div className="absolute inset-0 z-10 flex items-center justify-center pointer-events-none bg-[var(--bg)]/60 backdrop-blur-[1px]">
+              <p className="font-body text-sm text-[var(--accent)] border border-[var(--accent)]/40 rounded-md px-4 py-2 bg-[var(--bg)]/80">
+                Drop to upload
+              </p>
+            </div>
+          )}
+
+          <div className="px-6 py-4 border-b border-[var(--border-subtle)] flex items-center justify-between gap-3">
+            <span className="font-mono text-xs tracking-widest text-[var(--text-muted)] uppercase truncate">
               {fileName ?? "Document Viewer"}
             </span>
             <IngestStatusBadge status={ingestStatus} result={ingestResult} />
           </div>
 
+          {documents.length > 0 && (
+            <div className="px-4 py-2 border-b border-[var(--border-subtle)] flex items-center gap-1.5 overflow-x-auto">
+              {documents.map((doc) => (
+                <div
+                  key={doc.id}
+                  className={`group shrink-0 flex items-center rounded-full border max-w-[180px]
+                              transition-all duration-200 ease-out hover:scale-[1.03] ${
+                    doc.id === activeDocId
+                      ? "bg-[var(--accent)]/15 border-[var(--accent)]/40 text-[var(--accent)]"
+                      : "bg-[var(--surface-2)] border-[var(--border-subtle)] text-[var(--text-muted)] hover:text-[var(--text)] hover:border-[var(--border-subtle)]"
+                  }`}
+                >
+                  <button
+                    onClick={() => handleSwitchDocument(doc.id)}
+                    title={doc.title}
+                    className="font-mono text-[11px] pl-2.5 py-1 truncate"
+                  >
+                    {doc.title}
+                  </button>
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      handleRemoveDocument(doc.id);
+                    }}
+                    title="Remove document"
+                    aria-label={`Remove ${doc.title}`}
+                    className="shrink-0 pl-1 pr-2 py-1 font-mono text-[11px] leading-none
+                               opacity-0 group-hover:opacity-100 hover:text-red-300
+                               hover:scale-125 active:scale-90 transition-all"
+                  >
+                    ✕
+                  </button>
+                </div>
+              ))}
+              <button
+                onClick={() => fileInputRef.current?.click()}
+                title="Upload another document"
+                disabled={ingestStatus === "uploading"}
+                className="shrink-0 font-mono text-[11px] px-2.5 py-1 rounded-full border border-dashed
+                           border-[var(--border-subtle)] text-[var(--text-muted)] hover:text-[var(--text)] hover:border-[var(--border-subtle)]
+                           hover:scale-[1.05] active:scale-[0.95] transition-all disabled:opacity-40
+                           disabled:hover:scale-100"
+              >
+                + Add
+              </button>
+            </div>
+          )}
+
           <input
             ref={fileInputRef}
             type="file"
-            accept=".pdf,.docx,.txt,.png,.jpg,.jpeg"
+            accept=".pdf"
             className="hidden"
             onChange={handleFileSelected}
           />
@@ -515,24 +651,13 @@ export default function WorkspacePage() {
 
           {fileBytes ? (
             <div className="flex-1 min-h-0">
-              {fileMimeType === "application/pdf" ? (
-                <PdfViewer
-                  fileBytes={fileBytes}
-                  jumpToPage={jumpToPage}
-                  highlights={activeHighlights}
-                  onAskAboutSelection={handleAskAboutSelection}
-                  className="h-full"
-                />
-              ) : fileMimeType?.startsWith("image/") ? (
-                <ImagePreview
-                  fileBytes={fileBytes}
-                  mimeType={fileMimeType}
-                  highlights={activeHighlights}
-                  className="h-full"
-                />
-              ) : (
-                <UnsupportedPreview fileName={fileName} className="h-full" />
-              )}
+              <PdfViewer
+                fileBytes={fileBytes}
+                jumpToPage={jumpToPage}
+                highlights={activeHighlights}
+                onAskAboutSelection={handleAskAboutSelection}
+                className="h-full"
+              />
             </div>
           ) : (
             <div className="flex-1 flex items-center justify-center p-10">
@@ -549,13 +674,14 @@ export default function WorkspacePage() {
                   <path d="M14 2v6h6" />
                 </svg>
                 <p className="font-body text-sm text-center px-8">
-                  No document loaded yet — upload a PDF, DOCX, or image to get
-                  started.
+                  No document loaded yet — drag and drop a PDF, DOCX, or
+                  image here, or upload one.
                 </p>
                 <button
                   onClick={() => fileInputRef.current?.click()}
                   className="font-body text-sm font-medium rounded-md bg-highlight-400 text-ink-950
-                             px-4 py-2 hover:bg-highlight-500 transition-colors mt-2"
+                             px-4 py-2 hover:bg-highlight-500 hover:scale-[1.03] active:scale-[0.97]
+                             transition-all mt-2"
                 >
                   Upload document
                 </button>
@@ -566,15 +692,15 @@ export default function WorkspacePage() {
 
         {/* Right panel — Chat / Summary / Highlights */}
         <section className="flex flex-col min-h-[50vh] md:min-h-0">
-          <div className="px-6 border-b border-white/10 flex items-center gap-1">
+          <div className="px-6 border-b border-[var(--border-subtle)] flex items-center gap-1">
             {TABS.map((tab) => (
               <button
                 key={tab.id}
                 onClick={() => setActiveTab(tab.id)}
                 className={`font-body text-sm px-4 py-3 border-b-2 transition-colors ${
                   activeTab === tab.id
-                    ? "border-highlight-400 text-paper-50"
-                    : "border-transparent text-slate-400 hover:text-paper-50"
+                    ? "border-[var(--accent)] text-[var(--text)]"
+                    : "border-transparent text-[var(--text-muted)] hover:text-[var(--text)]"
                 }`}
               >
                 {tab.label}
@@ -584,7 +710,11 @@ export default function WorkspacePage() {
 
           {activeTab === "chat" && (
             <ChatPanel
-              ready={ingestResult?.status === "ready"}
+              ready={
+                chatScope === "all"
+                  ? documents.length > 0
+                  : ingestResult?.status === "ready"
+              }
               chunkCount={ingestResult?.chunk_count}
               pageCount={ingestResult?.page_count}
               messages={chatMessages}
@@ -597,6 +727,10 @@ export default function WorkspacePage() {
               onCitationClick={handleCitationClick}
               scopedSelection={scopedSelection}
               onClearScoped={() => setScopedSelection(null)}
+              chatScope={chatScope}
+              onChatScopeChange={handleChatScopeChange}
+              multiDocAvailable={documents.length > 1}
+              documentCount={documents.length}
             />
           )}
 
@@ -609,6 +743,7 @@ export default function WorkspacePage() {
               result={summaryResult}
               error={summaryError}
               onGenerate={handleGenerateSummary}
+              documentTitle={fileName ?? "Document"}
             />
           )}
 
@@ -634,12 +769,12 @@ function IngestStatusBadge({
 }) {
   if (status === "idle") {
     return (
-      <span className="font-mono text-xs text-slate-600">25% – 500%</span>
+      <span className="font-mono text-xs text-[var(--text-muted)]">25% – 500%</span>
     );
   }
   if (status === "uploading") {
     return (
-      <span className="font-mono text-xs text-highlight-400 animate-pulse">
+      <span className="font-mono text-xs text-[var(--accent)] animate-pulse">
         Processing…
       </span>
     );
@@ -668,6 +803,10 @@ function ChatPanel({
   onCitationClick,
   scopedSelection,
   onClearScoped,
+  chatScope,
+  onChatScopeChange,
+  multiDocAvailable,
+  documentCount,
 }: {
   ready: boolean;
   chunkCount?: number;
@@ -679,27 +818,136 @@ function ChatPanel({
   onInputChange: (v: string) => void;
   onSend: () => void;
   onKeyDown: (e: React.KeyboardEvent<HTMLTextAreaElement>) => void;
-  onCitationClick: (page: number, citations: Citation[]) => void;
+  onCitationClick: (page: number, citations: Citation[], docId?: string) => void;
   scopedSelection: { text: string; page: number } | null;
   onClearScoped: () => void;
+  chatScope: ChatScope;
+  onChatScopeChange: (scope: ChatScope) => void;
+  multiDocAvailable: boolean;
+  documentCount: number;
 }) {
+  const [showHistory, setShowHistory] = useState(false);
+  const messageRefs = useRef<(HTMLDivElement | null)[]>([]);
+  const userQuestions = messages
+    .map((m, i) => ({ m, i }))
+    .filter(({ m }) => m.role === "user");
+
+  const jumpToMessage = (i: number) => {
+    setShowHistory(false);
+    messageRefs.current[i]?.scrollIntoView({ behavior: "smooth", block: "center" });
+  };
+
+  const scopeToggle = documentCount > 0 && (
+    <div className="px-4 pt-3 pb-1 flex items-center justify-between gap-1.5">
+      <div className="flex items-center gap-1.5">
+        <button
+          onClick={() => onChatScopeChange("single")}
+          className={`font-mono text-[11px] px-2.5 py-1 rounded-full border transition-all
+                      hover:scale-[1.04] active:scale-[0.96] ${
+            chatScope === "single"
+              ? "bg-[var(--accent)]/15 border-[var(--accent)]/40 text-[var(--accent)]"
+              : "bg-[var(--surface-2)] border-[var(--border-subtle)] text-[var(--text-muted)] hover:text-[var(--text)]"
+          }`}
+        >
+          This document
+        </button>
+        <button
+          onClick={() => onChatScopeChange("all")}
+          title={
+            multiDocAvailable
+              ? undefined
+              : "Upload another document to get more out of this mode"
+          }
+          className={`font-mono text-[11px] px-2.5 py-1 rounded-full border transition-all
+                      hover:scale-[1.04] active:scale-[0.96] ${
+            chatScope === "all"
+              ? "bg-[var(--accent)]/15 border-[var(--accent)]/40 text-[var(--accent)]"
+              : "bg-[var(--surface-2)] border-[var(--border-subtle)] text-[var(--text-muted)] hover:text-[var(--text)]"
+          }`}
+        >
+          All documents{documentCount > 0 ? ` (${documentCount})` : ""}
+        </button>
+      </div>
+
+      {messages.length > 0 && (
+        <button
+          onClick={() => setShowHistory((v) => !v)}
+          title="Past questions in this thread"
+          className={`shrink-0 inline-flex items-center gap-1 font-mono text-[11px] px-2.5 py-1
+                      rounded-full border transition-all hover:scale-[1.04] active:scale-[0.96] ${
+            showHistory
+              ? "bg-[var(--accent)]/15 border-[var(--accent)]/40 text-[var(--accent)]"
+              : "bg-[var(--surface-2)] border-[var(--border-subtle)] text-[var(--text-muted)] hover:text-[var(--text)]"
+          }`}
+        >
+          <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <circle cx="12" cy="12" r="9" />
+            <path d="M12 7v5l3 3" />
+          </svg>
+          History
+        </button>
+      )}
+    </div>
+  );
+
   if (!ready) {
     return (
-      <div className="flex-1 flex items-center justify-center p-10">
-        <p className="font-body text-sm text-slate-400 text-center max-w-xs">
-          Ask a question about your document once it's uploaded. Answers will
-          cite the exact page they came from.
-        </p>
+      <div className="flex-1 flex flex-col min-h-0">
+        {scopeToggle}
+        <div className="flex-1 flex items-center justify-center p-10">
+          <p className="font-body text-sm text-[var(--text-muted)] text-center max-w-xs">
+            Ask a question about your document once it's uploaded. Answers will
+            cite the exact page they came from.
+          </p>
+        </div>
       </div>
     );
   }
 
   return (
     <div className="flex-1 flex flex-col min-h-0">
+      {scopeToggle}
+      <div className="relative flex-1 flex flex-col min-h-0">
+        {showHistory && (
+          <div className="absolute inset-x-4 top-2 z-20 max-h-72 overflow-y-auto
+                           rounded-md border border-[var(--border-subtle)] bg-[var(--surface)] shadow-page">
+            <div className="flex items-center justify-between px-3 py-2 border-b border-[var(--border-subtle)]">
+              <span className="font-mono text-[10px] tracking-widest text-[var(--text-muted)] uppercase">
+                Past questions
+              </span>
+              <button
+                onClick={() => setShowHistory(false)}
+                className="font-mono text-xs text-[var(--text-muted)] hover:text-[var(--text)]
+                           hover:scale-125 active:scale-90 transition-all"
+                aria-label="Close history"
+              >
+                ✕
+              </button>
+            </div>
+            {userQuestions.length === 0 ? (
+              <p className="font-body text-xs text-[var(--text-muted)] px-3 py-3">
+                No questions yet — ask something to start building history.
+              </p>
+            ) : (
+              userQuestions.map(({ m, i }) => (
+                <button
+                  key={i}
+                  onClick={() => jumpToMessage(i)}
+                  className="block w-full text-left font-body text-xs text-[var(--text-muted)] hover:bg-[var(--surface-2)]
+                             px-3 py-2 border-b border-[var(--border-subtle)] last:border-b-0 truncate"
+                >
+                  {m.content}
+                </button>
+              ))
+            )}
+          </div>
+        )}
       {messages.length === 0 ? (
         <div className="flex-1 flex items-center justify-center p-10">
-          <p className="font-body text-sm text-slate-400 text-center max-w-xs">
-            {chunkCount != null && pageCount != null
+          <p className="font-body text-sm text-[var(--text-muted)] text-center max-w-xs">
+            {chatScope === "all"
+              ? `Searching across ${documentCount} document${documentCount === 1 ? "" : "s"}. Ask anything — answers will say which document they came from.`
+              : chunkCount != null && pageCount != null
               ? `Ready — ${chunkCount} chunks indexed across ${pageCount} pages. Ask anything about this document.`
               : "Document indexed. Ask anything about it."}
           </p>
@@ -709,34 +957,80 @@ function ChatPanel({
           {messages.map((m, i) => (
             <div
               key={i}
+              ref={(el) => {
+                messageRefs.current[i] = el;
+              }}
               className={`flex ${
                 m.role === "user" ? "justify-end" : "justify-start"
               }`}
             >
               <div
-                className={`max-w-[85%] rounded-lg px-4 py-2 font-body text-sm whitespace-pre-wrap ${
+                className={`max-w-[85%] rounded-lg px-4 py-2 font-body text-sm ${
                   m.role === "user"
-                    ? "bg-highlight-400 text-ink-950"
-                    : "bg-white/5 text-paper-50"
+                    ? "bg-highlight-400 text-ink-950 whitespace-pre-wrap"
+                    : "bg-[var(--surface-2)] text-[var(--text)]"
                 }`}
               >
-                {m.content || (m.streaming ? "…" : "")}
+                {m.role === "assistant" ? (
+                  m.content ? (
+                    <div
+                      className="prose prose-sm prose-invert max-w-none
+                                 prose-p:my-2 prose-p:leading-relaxed
+                                 prose-headings:font-display prose-headings:mt-3 prose-headings:mb-1.5
+                                 prose-ul:my-2 prose-ol:my-2 prose-li:my-0.5
+                                 prose-strong:text-[var(--text)] prose-strong:font-semibold
+                                 prose-code:text-[var(--accent)] prose-code:before:content-none prose-code:after:content-none
+                                 prose-pre:bg-black/30 prose-pre:my-2
+                                 prose-a:text-[var(--accent)] prose-blockquote:border-[var(--accent)]/40"
+                    >
+                      <ReactMarkdown>{m.content}</ReactMarkdown>
+                    </div>
+                  ) : m.streaming ? (
+                    <span className="text-[var(--text-muted)]">…</span>
+                  ) : null
+                ) : (
+                  m.content
+                )}
                 {m.citations && m.citations.length > 0 && (
-                  <div className="mt-2 flex flex-wrap gap-1">
-                    {/* One chip per distinct page cited, even though the
-                        answer may be grounded in several chunks on that
-                        page — clicking it highlights all of them. */}
-                    {Array.from(new Set(m.citations.map((c) => c.page_num)))
-                      .sort((a, b) => a - b)
-                      .map((p) => (
+                  <div className="mt-2 flex flex-wrap gap-1.5">
+                    {Array.from(
+                      new Map(
+                        m.citations.map((c) => [`${c.doc_id ?? ""}::${c.page_num}`, c])
+                      ).values()
+                    )
+                      .sort((a, b) => a.page_num - b.page_num)
+                      .map((c) => (
                         <button
-                          key={p}
-                          onClick={() => onCitationClick(p, m.citations!)}
-                          className="font-mono text-[10px] px-1.5 py-0.5 rounded bg-black/20 text-slate-300
-                                     hover:bg-black/40 hover:text-paper-50 transition-colors cursor-pointer"
-                          title={`Jump to page ${p}`}
+                          key={`${c.doc_id ?? ""}-${c.page_num}`}
+                          onClick={() => onCitationClick(c.page_num, m.citations!, c.doc_id)}
+                          className="inline-flex items-center gap-1 font-mono text-[10px] leading-none
+                                     px-2 py-1 rounded-full bg-[var(--accent)]/10 text-[var(--accent)]
+                                     border border-[var(--accent)]/30
+                                     hover:bg-[var(--accent)]/20 hover:border-[var(--accent)]/50
+                                     hover:scale-[1.05] active:scale-[0.95]
+                                     transition-all cursor-pointer max-w-[180px]"
+                          title={
+                            c.doc_title
+                              ? `${c.doc_title} — jump to page ${c.page_num}`
+                              : `Jump to page ${c.page_num}`
+                          }
                         >
-                          p. {p}
+                          <svg
+                            width="9"
+                            height="9"
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            strokeWidth="2"
+                            className="shrink-0"
+                          >
+                            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                            <path d="M14 2v6h6" />
+                          </svg>
+                          {c.doc_title && (
+                            <span className="truncate">{c.doc_title}, </span>
+                          )}
+                          p.&nbsp;{c.page_num}
                         </button>
                       ))}
                   </div>
@@ -746,6 +1040,7 @@ function ChatPanel({
           ))}
         </div>
       )}
+      </div>
 
       {error && (
         <div className="px-6 py-2 bg-red-500/10 border-t border-red-500/20 text-red-300 text-xs font-body">
@@ -754,9 +1049,9 @@ function ChatPanel({
       )}
 
       {scopedSelection && (
-        <div className="mx-4 mt-2 px-3 py-2 rounded-md bg-highlight-400/10 border border-highlight-400/30 flex items-start justify-between gap-2">
-          <p className="font-body text-xs text-slate-300">
-            <span className="text-highlight-400 font-medium">
+        <div className="mx-4 mt-2 px-3 py-2 rounded-md bg-[var(--accent)]/10 border border-[var(--accent)]/30 flex items-start justify-between gap-2">
+          <p className="font-body text-xs text-[var(--text-muted)]">
+            <span className="text-[var(--accent)] font-medium">
               Asking about this passage (p. {scopedSelection.page}):
             </span>{" "}
             "
@@ -767,7 +1062,7 @@ function ChatPanel({
           </p>
           <button
             onClick={onClearScoped}
-            className="font-mono text-xs text-slate-400 hover:text-paper-50 shrink-0"
+            className="font-mono text-xs text-[var(--text-muted)] hover:text-[var(--text)] shrink-0"
             title="Ask about the whole document instead"
           >
             ✕
@@ -775,7 +1070,7 @@ function ChatPanel({
         </div>
       )}
 
-      <div className="border-t border-white/10 p-4 flex items-end gap-2">
+      <div className="border-t border-[var(--border-subtle)] p-4 flex items-end gap-2">
         <textarea
           value={input}
           onChange={(e) => onInputChange(e.target.value)}
@@ -786,16 +1081,17 @@ function ChatPanel({
               : "Ask about this document…"
           }
           rows={1}
-          className="flex-1 resize-none rounded-md bg-white/5 border border-white/10 px-3 py-2
-                     font-body text-sm text-paper-50 placeholder:text-slate-500
+          className="flex-1 resize-none rounded-md bg-[var(--surface-2)] border border-[var(--border-subtle)] px-3 py-2
+                     font-body text-sm text-[var(--text)] placeholder:text-[var(--text-muted)]
                      focus:outline-none focus:ring-1 focus:ring-highlight-400"
         />
         <button
           onClick={onSend}
           disabled={streaming || !input.trim()}
           className="font-body text-sm font-medium rounded-md bg-highlight-400 text-ink-950
-                     px-4 py-2 hover:bg-highlight-500 transition-colors
-                     disabled:opacity-40 disabled:cursor-not-allowed"
+                     px-4 py-2 hover:bg-highlight-500 hover:scale-[1.03] active:scale-[0.97]
+                     transition-all disabled:opacity-40 disabled:cursor-not-allowed
+                     disabled:hover:scale-100"
         >
           {streaming ? "…" : "Send"}
         </button>
@@ -812,6 +1108,7 @@ function SummaryPanel({
   result,
   error,
   onGenerate,
+  documentTitle,
 }: {
   ready: boolean;
   status: "idle" | "loading" | "ready" | "error";
@@ -820,11 +1117,41 @@ function SummaryPanel({
   result: DocumentSummary | null;
   error: string | null;
   onGenerate: () => void;
+  documentTitle: string;
 }) {
+  const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">(
+    "idle"
+  );
+  const [pdfError, setPdfError] = useState<string | null>(null);
+
+  const handleCopy = async () => {
+    if (!result) return;
+    const ok = await copySummaryToClipboard(documentTitle, result);
+    setCopyState(ok ? "copied" : "failed");
+    setTimeout(() => setCopyState("idle"), 2000);
+  };
+
+  const handleMarkdown = () => {
+    if (!result) return;
+    downloadMarkdown(documentTitle, result);
+  };
+
+  const handlePdf = () => {
+    if (!result) return;
+    setPdfError(null);
+    try {
+      exportSummaryAsPdf(documentTitle, result);
+    } catch (err) {
+      setPdfError(
+        err instanceof Error ? err.message : "Couldn't open the print window."
+      );
+    }
+  };
+
   if (!ready) {
     return (
       <div className="flex-1 flex items-center justify-center p-10">
-        <p className="font-body text-sm text-slate-400 text-center max-w-xs">
+        <p className="font-body text-sm text-[var(--text-muted)] text-center max-w-xs">
           An executive summary and key takeaways will appear here once your
           document finishes uploading.
         </p>
@@ -835,14 +1162,15 @@ function SummaryPanel({
   if (status === "idle") {
     return (
       <div className="flex-1 flex flex-col items-center justify-center gap-3 p-10">
-        <p className="font-body text-sm text-slate-400 text-center max-w-xs">
+        <p className="font-body text-sm text-[var(--text-muted)] text-center max-w-xs">
           Generate an executive summary, key points, and named entities for
           this document.
         </p>
         <button
           onClick={onGenerate}
           className="font-body text-sm font-medium rounded-md bg-highlight-400 text-ink-950
-                     px-4 py-2 hover:bg-highlight-500 transition-colors"
+                     px-4 py-2 hover:bg-highlight-500 hover:scale-[1.03] active:scale-[0.97]
+                     transition-all"
         >
           Generate Summary
         </button>
@@ -853,11 +1181,11 @@ function SummaryPanel({
   if (status === "loading") {
     return (
       <div className="flex-1 flex flex-col items-center justify-center gap-2 p-10">
-        <span className="font-mono text-xs text-highlight-400 animate-pulse">
+        <span className="font-mono text-xs text-[var(--accent)] animate-pulse">
           {message ?? "Working…"}
         </span>
         {progress && (
-          <span className="font-mono text-xs text-slate-500">
+          <span className="font-mono text-xs text-[var(--text-muted)]">
             {progress.completed} / {progress.total} section(s)
           </span>
         )}
@@ -873,8 +1201,9 @@ function SummaryPanel({
         </p>
         <button
           onClick={onGenerate}
-          className="font-body text-sm font-medium rounded-md bg-white/10 text-paper-50
-                     px-4 py-2 hover:bg-white/20 transition-colors"
+          className="font-body text-sm font-medium rounded-md bg-[var(--surface-2)] text-[var(--text)]
+                     px-4 py-2 hover:bg-[var(--surface)] hover:scale-[1.03] active:scale-[0.97]
+                     transition-all"
         >
           Try again
         </button>
@@ -882,31 +1211,30 @@ function SummaryPanel({
     );
   }
 
-  // status === "ready"
   if (!result) return null;
   return (
     <div className="flex-1 min-h-0 overflow-y-auto px-6 py-5 space-y-6">
       <div>
-        <h3 className="font-mono text-xs tracking-widest text-slate-400 uppercase mb-2">
+        <h3 className="font-mono text-xs tracking-widest text-[var(--text-muted)] uppercase mb-2">
           Overview
         </h3>
-        <p className="font-body text-sm text-paper-50 leading-relaxed">
+        <p className="font-body text-sm text-[var(--text)] leading-relaxed">
           {result.overview}
         </p>
       </div>
 
       {result.key_points.length > 0 && (
         <div>
-          <h3 className="font-mono text-xs tracking-widest text-slate-400 uppercase mb-2">
+          <h3 className="font-mono text-xs tracking-widest text-[var(--text-muted)] uppercase mb-2">
             Key Points
           </h3>
           <ul className="space-y-1.5">
             {result.key_points.map((point, i) => (
               <li
                 key={i}
-                className="font-body text-sm text-paper-50 leading-relaxed flex gap-2"
+                className="font-body text-sm text-[var(--text)] leading-relaxed flex gap-2"
               >
-                <span className="text-highlight-400 shrink-0">•</span>
+                <span className="text-[var(--accent)] shrink-0">•</span>
                 <span>{point}</span>
               </li>
             ))}
@@ -916,14 +1244,14 @@ function SummaryPanel({
 
       {result.entities.length > 0 && (
         <div>
-          <h3 className="font-mono text-xs tracking-widest text-slate-400 uppercase mb-2">
+          <h3 className="font-mono text-xs tracking-widest text-[var(--text-muted)] uppercase mb-2">
             Entities
           </h3>
           <div className="flex flex-wrap gap-1.5">
             {result.entities.map((entity, i) => (
               <span
                 key={i}
-                className="font-mono text-xs px-2 py-1 rounded bg-white/5 text-slate-300"
+                className="font-mono text-xs px-2 py-1 rounded bg-[var(--surface-2)] text-[var(--text-muted)]"
               >
                 {entity}
               </span>
@@ -932,9 +1260,48 @@ function SummaryPanel({
         </div>
       )}
 
+      <div>
+        <h3 className="font-mono text-xs tracking-widest text-[var(--text-muted)] uppercase mb-2">
+          Export
+        </h3>
+        <div className="flex flex-wrap gap-2">
+          <button
+            onClick={handleMarkdown}
+            className="font-body text-xs font-medium rounded-md bg-[var(--surface-2)] text-[var(--text)]
+                       px-3 py-1.5 hover:bg-[var(--surface)] hover:scale-[1.03] active:scale-[0.97]
+                       transition-all"
+          >
+            Export Markdown
+          </button>
+          <button
+            onClick={handleCopy}
+            className="font-body text-xs font-medium rounded-md bg-[var(--surface-2)] text-[var(--text)]
+                       px-3 py-1.5 hover:bg-[var(--surface)] hover:scale-[1.03] active:scale-[0.97]
+                       transition-all"
+          >
+            {copyState === "copied"
+              ? "Copied!"
+              : copyState === "failed"
+              ? "Copy failed"
+              : "Copy to Clipboard"}
+          </button>
+          <button
+            onClick={handlePdf}
+            className="font-body text-xs font-medium rounded-md bg-[var(--surface-2)] text-[var(--text)]
+                       px-3 py-1.5 hover:bg-[var(--surface)] hover:scale-[1.03] active:scale-[0.97]
+                       transition-all"
+          >
+            Export PDF
+          </button>
+        </div>
+        {pdfError && (
+          <p className="font-body text-xs text-red-300 mt-2">{pdfError}</p>
+        )}
+      </div>
+
       <button
         onClick={onGenerate}
-        className="font-body text-xs text-slate-400 hover:text-paper-50 transition-colors"
+        className="font-body text-xs text-[var(--text-muted)] hover:text-[var(--text)] transition-colors"
       >
         Regenerate summary
       </button>
@@ -954,7 +1321,7 @@ function HighlightsPanel({
   if (highlights.length === 0) {
     return (
       <div className="flex-1 flex items-center justify-center p-10">
-        <p className="font-body text-sm text-slate-400 text-center max-w-xs">
+        <p className="font-body text-sm text-[var(--text-muted)] text-center max-w-xs">
           Select text in the document and tap "Explain Simply," "Summarize
           Selection," or "Identify Risks" to save a highlight here.
         </p>
@@ -967,18 +1334,19 @@ function HighlightsPanel({
       {highlights.map((h) => (
         <div
           key={h.id}
-          className="group relative w-full text-left rounded-md bg-white/5 hover:bg-white/10 transition-colors p-3"
+          className="group relative w-full text-left rounded-md bg-[var(--surface-2)] hover:bg-[var(--surface)]
+                     transition-all duration-200 ease-out hover:scale-[1.01] p-3"
         >
           <button onClick={() => onJump(h)} className="w-full text-left">
             <div className="flex items-center justify-between gap-2 mb-1.5 pr-5">
-              <span className="font-mono text-[10px] px-1.5 py-0.5 rounded bg-highlight-400/20 text-highlight-400 uppercase tracking-wide">
+              <span className="font-mono text-[10px] px-1.5 py-0.5 rounded bg-[var(--accent)]/20 text-[var(--accent)] uppercase tracking-wide">
                 {PRESET_LABELS[h.preset]}
               </span>
-              <span className="font-mono text-[10px] text-slate-500">
+              <span className="font-mono text-[10px] text-[var(--text-muted)]">
                 p. {h.page}
               </span>
             </div>
-            <p className="font-body text-xs text-slate-300 leading-relaxed line-clamp-3">
+            <p className="font-body text-xs text-[var(--text-muted)] leading-relaxed line-clamp-3">
               {h.text}
             </p>
           </button>
@@ -988,8 +1356,8 @@ function HighlightsPanel({
               onDelete(h);
             }}
             title="Remove highlight"
-            className="absolute top-2.5 right-2.5 font-mono text-xs text-slate-500 hover:text-red-300
-                       opacity-0 group-hover:opacity-100 transition-opacity"
+            className="absolute top-2.5 right-2.5 font-mono text-xs text-[var(--text-muted)] hover:text-red-300
+                       opacity-0 group-hover:opacity-100 hover:scale-125 active:scale-90 transition-all"
           >
             ✕
           </button>

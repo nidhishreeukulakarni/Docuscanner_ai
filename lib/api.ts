@@ -144,6 +144,11 @@ export interface Citation {
   page_num: number;
   /** Null for chunks ingested before bbox extraction existed. */
   bbox: BBox | null;
+  /** Only present on citations from POST /chat-all (Day 2) — identifies
+   * which of the user's documents this excerpt came from, since a
+   * multi-document answer may cite several different files. */
+  doc_id?: string;
+  doc_title?: string;
 }
 
 export interface ChatStreamHandlers {
@@ -251,6 +256,105 @@ export function sendChatMessage(
   })();
 
   return controller;
+}
+
+// ---------------------------------------------------------------------
+// Multi-document chat (Day 2) — POST /chat-all
+// ---------------------------------------------------------------------
+//
+// Same SSE shape as sendChatMessage, but not scoped to one document_id
+// — the backend (app/routers/chat_all.py) searches across all of the
+// current user's "ready" documents. Citations here carry doc_id +
+// doc_title so the frontend can show which file each excerpt came
+// from and, if clicked, switch the viewer to that document.
+
+export function sendMultiDocChatMessage(
+  question: string,
+  history: ChatHistoryTurn[],
+  handlers: ChatStreamHandlers
+): AbortController {
+  const controller = new AbortController();
+
+  (async () => {
+    let res: Response;
+    try {
+      res = await fetch(`${API_BASE_URL}/chat-all`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ question, history }),
+        signal: controller.signal,
+      });
+    } catch (err) {
+      handlers.onError?.(
+        err instanceof Error ? err : new Error("Network error")
+      );
+      return;
+    }
+
+    if (!res.ok || !res.body) {
+      let detail = res.statusText;
+      try {
+        const body = await res.json();
+        detail = body.detail ?? detail;
+      } catch {
+        // not JSON — keep statusText
+      }
+      handlers.onError?.(new ApiError(res.status, detail));
+      return;
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        let boundary: number;
+        while ((boundary = buffer.indexOf("\n\n")) !== -1) {
+          const frame = buffer.slice(0, boundary);
+          buffer = buffer.slice(boundary + 2);
+
+          let event = "message";
+          let data = "";
+          for (const line of frame.split("\n")) {
+            if (line.startsWith("event: ")) event = line.slice(7);
+            else if (line.startsWith("data: ")) data = line.slice(6);
+          }
+          if (!data) continue;
+
+          const parsed = JSON.parse(data);
+          if (event === "citations") {
+            handlers.onCitations?.(parsed.citations ?? []);
+          } else if (event === "token") {
+            handlers.onToken(parsed.text ?? "");
+          } else if (event === "done") {
+            handlers.onDone?.();
+          }
+        }
+      }
+    } catch (err) {
+      if ((err as Error).name !== "AbortError") {
+        handlers.onError?.(
+          err instanceof Error ? err : new Error("Stream error")
+        );
+      }
+    }
+  })();
+
+  return controller;
+}
+
+export async function getMultiDocChatHistory(): Promise<ChatHistoryMessage[]> {
+  const res = await fetch(`${API_BASE_URL}/chat-all/history`, {
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new ApiError(res.status, await parseErrorDetail(res));
+  const body = await res.json();
+  return body.messages ?? [];
 }
 
 // ---------------------------------------------------------------------
@@ -447,47 +551,4 @@ export async function deleteAnnotation(
     { method: "DELETE", headers: authHeaders() }
   );
   if (!res.ok) throw new ApiError(res.status, await parseErrorDetail(res));
-}
-
-// ---------------------------------------------------------------------
-// Document list + re-fetch (Step 10)
-// ---------------------------------------------------------------------
-//
-// GET /documents lists the current user's past uploads; GET
-// /documents/{id}/file streams the original bytes back so a past
-// document can be reopened into <PdfViewer> instead of every upload
-// being a one-shot, refresh-loses-everything session. Matches the new
-// endpoints in app/routers/documents.py.
-
-export interface DocumentListItem {
-  document_id: string;
-  title: string;
-  status: "ready" | "processing" | string;
-  page_count: number;
-  mime_type: string;
-  created_at: string;
-}
-
-export async function listDocuments(): Promise<DocumentListItem[]> {
-  const res = await fetch(`${API_BASE_URL}/documents`, {
-    headers: authHeaders(),
-  });
-  if (!res.ok) throw new ApiError(res.status, await parseErrorDetail(res));
-  const body = await res.json();
-  return body.documents ?? [];
-}
-
-/**
- * Fetches a previously uploaded document's original bytes so it can
- * be handed straight to <PdfViewer fileBytes={...}>, the same way a
- * fresh upload's in-memory bytes are used.
- */
-export async function getDocumentFile(
-  documentId: string
-): Promise<ArrayBuffer> {
-  const res = await fetch(`${API_BASE_URL}/documents/${documentId}/file`, {
-    headers: authHeaders(),
-  });
-  if (!res.ok) throw new ApiError(res.status, await parseErrorDetail(res));
-  return res.arrayBuffer();
 }
